@@ -9,7 +9,7 @@
 #   - Windows: fallback ke winsound.Beep
 #   - Linux/Mac: fallback ke terminal bell (\a)
 #
-# Audio diputar di thread terpisah agar tidak memblokir main loop.
+# Audio diputar di thread terpisah agar tidak memblokir main loop.tdk dipakai
 # =============================================================================
 
 import time

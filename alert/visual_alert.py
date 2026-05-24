@@ -5,7 +5,7 @@
 # Perubahan v3:
 #   - Panel Overall Session Score di bagian atas sidebar
 #   - Tampilkan Grade (A/B/C/D/F), durasi sesi, breakdown waktu
-#   - Layout sidebar diatur ulang: Overall Score → Status → Scores → ...
+#   - Layout sidebar diatur ulang: Overall Score → Status → Scores → ... tdk dipakai
 # =============================================================================
 
 import cv2

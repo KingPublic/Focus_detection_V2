@@ -1,36 +1,15 @@
 #!/usr/bin/env python3
 # =============================================================================
-# main.py — Classroom Monitor (System 2)
-# Multi-Student Real-Time Focus & Behavior Monitoring
+# main.py — Classroom Monitor v3
 #
-# Perbedaan dengan System 1:
-#   - Deteksi unlimited mahasiswa sekaligus
-#   - Setiap mahasiswa punya ID persistent (IoU tracking)
-#   - Grade & score ditampilkan langsung di atas kepala
-#   - Sidebar berisi roster semua mahasiswa
-#   - Semua behavior System 1 berlaku per-mahasiswa
-#
-# Flow per frame:
-#   Webcam → Frame
-#     │
-#     ├─ FaceDetector → N wajah (bbox + 468 landmark masing-masing)
-#     │
-#     ├─ StudentTracker (IoU matching)
-#     │     → assign / update Student ID untuk tiap wajah
-#     │
-#     ├─ Per student (paralel):
-#     │     ├─ HeadPoseEstimator → pitch, yaw, roll
-#     │     ├─ EyeTracker        → EAR, iris gaze
-#     │     ├─ evaluate_behaviors() → set behavior aktif
-#     │     ├─ TemporalTracker   → durasi tiap behavior
-#     │     ├─ compute_severity() → OK/WARNING/CRITICAL
-#     │     └─ StudentState.update_behaviors()
-#     │           → ScoreCalculator + SessionLogger update
-#     │
-#     ├─ ClassroomVisualRenderer
-#     │     → bbox + badge per student + sidebar roster
-#     │
-#     └─ AudioAlert (jika ada student CRITICAL)
+# FIX KRITIS v3:
+#   1. zip(faces, students) diganti dengan indeks eksplisit setelah NMS
+#      → tiap face_data dijamin ke-assign ke student yang benar
+#   2. Sinkronisasi faces ↔ tracker: bboxes yang masuk ke tracker
+#      diambil DARI faces hasil NMS (bukan dari hasil mediapipe langsung)
+#      sehingga urutan selalu konsisten
+#   3. Error handling di setiap step per-student → crash terlokalisir,
+#      tidak menghentikan seluruh program
 # =============================================================================
 
 import sys
@@ -42,7 +21,7 @@ import numpy as np
 import config.settings as cfg
 from detection.face_detector     import FaceDetector
 from detection.head_pose          import HeadPoseEstimator, HeadPoseResult
-from detection.eye_tracker        import EyeTrackResult
+from detection.eye_tracker        import EyeTracker
 from detection.behavior_analyzer  import evaluate_behaviors, compute_severity
 from tracking.student_tracker     import StudentTracker
 from alert.classroom_visual       import ClassroomVisualRenderer
@@ -51,33 +30,27 @@ from utils.fps_counter            import FPSCounter
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Classroom Monitor — System 2")
-    p.add_argument("--camera",    type=int, default=cfg.CAMERA_INDEX)
-    p.add_argument("--width",     type=int, default=cfg.FRAME_WIDTH)
-    p.add_argument("--height",    type=int, default=cfg.FRAME_HEIGHT)
-    p.add_argument("--no-audio",  action="store_true")
-    p.add_argument("--show-lm",   action="store_true")
+    p = argparse.ArgumentParser(description="Classroom Monitor v3")
+    p.add_argument("--camera",   type=int, default=cfg.CAMERA_INDEX)
+    p.add_argument("--width",    type=int, default=cfg.FRAME_WIDTH)
+    p.add_argument("--height",   type=int, default=cfg.FRAME_HEIGHT)
+    p.add_argument("--no-audio", action="store_true")
+    p.add_argument("--show-lm",  action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-
     print("=" * 60)
-    print("  CLASSROOM MONITOR — System 2")
-    print("  Multi-Student Rule-Based CV Monitoring")
-    print("=" * 60)
-    print(f"  Camera       : {args.camera}")
-    print(f"  Max faces    : {cfg.MAX_NUM_FACES}")
-    print(f"  Audio        : {'OFF' if args.no_audio else 'ON'}")
-    print(f"  Press Q/ESC to quit | R to reset | S for screenshot")
+    print("  CLASSROOM MONITOR v3 — Multi-Student")
+    print(f"  Camera: {args.camera} | MaxFaces: {cfg.MAX_NUM_FACES}")
+    print("  Q/ESC = quit | R = reset | S = screenshot")
     print("=" * 60)
 
-    # ── Buka kamera ───────────────────────────────────────────────────
+    # ── Kamera ────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print(f"[ERROR] Kamera {args.camera} tidak dapat dibuka.")
-        sys.exit(1)
+        print(f"[ERROR] Kamera {args.camera} tidak bisa dibuka."); sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
@@ -88,160 +61,161 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[Camera] {frame_w}x{frame_h}")
 
-    # ── Inisialisasi modul ────────────────────────────────────────────
-    face_detector  = FaceDetector()
-    head_pose_est  = HeadPoseEstimator(frame_w, frame_h)
-    student_tracker= StudentTracker()
-    visual_render  = ClassroomVisualRenderer(frame_w, frame_h)
-    audio_alert    = AudioAlert()
-    fps_counter    = FPSCounter(window_size=30)
+    # ── Modul ─────────────────────────────────────────────────────────
+    face_detector   = FaceDetector()
+    head_pose_est   = HeadPoseEstimator(frame_w, frame_h)
+    student_tracker = StudentTracker()
+    visual_render   = ClassroomVisualRenderer(frame_w, frame_h)
+    audio_alert     = AudioAlert()
+    fps_counter     = FPSCounter(window_size=30)
 
-    # EyeTracker: satu instance per student tidak efisien untuk classroom
-    # (EAR counter per-student), jadi kita hitung EAR stateless per frame
-    from detection.eye_tracker import EyeTracker
-    _eye_trackers = {}   # student_id → EyeTracker instance
-
-    print("[System] All modules initialized.\n")
-
-    # ── Dummy results untuk saat wajah tidak terdeteksi ───────────────
-    _dummy_hp = HeadPoseResult(0, 0, 0,
-                               np.zeros(3), np.zeros(3), False)
+    # EyeTracker per student (dict: student_id → EyeTracker)
+    eye_trackers: dict = {}
 
     prev_had_critical = False
+    print("[System] Ready.\n")
 
-    # ================================================================ #
+    # ================================================================= #
     #  MAIN LOOP
-    # ================================================================ #
+    # ================================================================= #
     while True:
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.05)
+            time.sleep(0.03)
             continue
 
         frame = cv2.flip(frame, 1)
         fps_counter.tick()
 
-        # ── STEP 1: Deteksi semua wajah ────────────────────────────────
+        # ── STEP 1: Deteksi wajah (dengan NMS di dalamnya) ─────────────
         face_present, faces = face_detector.process(frame)
 
-        # ── STEP 2: Student Tracker (IoU matching → persistent ID) ─────
-        bboxes   = [f.face_rect for f in faces] if face_present else []
-        students = student_tracker.update(bboxes)
+        # ── STEP 2: Kirim bbox ke tracker — SEJAJAR dengan faces ───────
+        # KUNCI FIX: bboxes diambil dari faces hasil NMS, bukan raw mediapipe
+        # Sehingga faces[i] ↔ bboxes[i] ↔ matched_students[i] SELALU SAMA
+        if face_present and faces:
+            bboxes          = [f.face_rect for f in faces]
+            matched_students = student_tracker.update(bboxes)
+            # matched_students[i] = StudentState untuk faces[i]
+        else:
+            matched_students = []
 
-        # ── STEP 3: Per-student analysis ───────────────────────────────
-        for face_data, student in zip(faces, students):
-            # Pastikan student punya EyeTracker instance sendiri
-            if student.id_num not in _eye_trackers:
-                _eye_trackers[student.id_num] = EyeTracker()
+        # ── STEP 3: Analisis per student ───────────────────────────────
+        # Iterasi dengan indeks eksplisit — BUKAN zip langsung
+        for i in range(len(faces)):
+            face_data = faces[i]
+            student   = matched_students[i]
 
-            et = _eye_trackers[student.id_num]
+            if student is None:
+                continue
 
-            # Head Pose
-            hp_result = head_pose_est.estimate(face_data)
+            try:
+                # EyeTracker per student
+                if student.id_num not in eye_trackers:
+                    eye_trackers[student.id_num] = EyeTracker()
+                et = eye_trackers[student.id_num]
 
-            # Eye / EAR
-            eye_result = et.analyze(face_data)
+                # Head Pose
+                hp = head_pose_est.estimate(face_data)
 
-            # Behavior Rules
-            active_behaviors = evaluate_behaviors(
-                hp_yaw   = hp_result.yaw   if hp_result.success else 0.0,
-                hp_pitch = hp_result.pitch if hp_result.success else 0.0,
-                hp_ok    = hp_result.success,
-                ear      = eye_result.ear_avg,
-                eye_closed = eye_result.eye_closed,
-                gaze_x   = eye_result.gaze_x,
-            )
+                # Eye / EAR
+                eye = et.analyze(face_data)
 
-            # Temporal Analysis
-            durations = student.temporal.update(active_behaviors)
+                # Behavior Rules
+                behaviors = evaluate_behaviors(
+                    hp_yaw    = hp.yaw    if hp.success else 0.0,
+                    hp_pitch  = hp.pitch  if hp.success else 0.0,
+                    hp_ok     = hp.success,
+                    ear       = eye.ear_avg,
+                    eye_closed= eye.eye_closed,
+                    gaze_x    = eye.gaze_x,
+                )
 
-            # Severity
-            severity = compute_severity(active_behaviors, durations)
+                # Temporal
+                durations = student.temporal.update(behaviors)
 
-            # Update state student (juga update score & session)
-            student.update_behaviors(
-                behaviors  = active_behaviors,
-                durations  = durations,
-                severity   = severity,
-                pitch      = hp_result.pitch if hp_result.success else 0.0,
-                yaw        = hp_result.yaw   if hp_result.success else 0.0,
-                ear        = eye_result.ear_avg,
-                eye_closed = eye_result.eye_closed,
-            )
+                # Severity
+                severity = compute_severity(behaviors, durations)
 
-            # Debug pose axes (opsional)
-            if cfg.SHOW_POSE_AXES and hp_result.success:
-                head_pose_est.draw_pose_axes(frame, hp_result, face_data,
-                                             axis_length=40.0)
-            if args.show_lm:
-                face_detector.draw_landmarks(frame, face_data)
+                # Update state student ini (score, session, dll)
+                student.update_behaviors(
+                    behaviors  = behaviors,
+                    durations  = durations,
+                    severity   = severity,
+                    pitch      = hp.pitch if hp.success else 0.0,
+                    yaw        = hp.yaw   if hp.success else 0.0,
+                    ear        = eye.ear_avg,
+                    eye_closed = eye.eye_closed,
+                )
 
-        # ── STEP 4: Tandai student yang tidak terdeteksi frame ini ─────
-        detected_ids = {s.id_num for s in students}
+                if cfg.SHOW_POSE_AXES and hp.success:
+                    head_pose_est.draw_pose_axes(frame, hp, face_data, 40.0)
+
+            except Exception as e:
+                # Error per-student tidak crash seluruh program
+                print(f"[WARN] Student {student.label} error: {e}")
+                continue
+
+        # ── STEP 4: Update student yang tidak terdeteksi ───────────────
+        detected_ids = {matched_students[i].id_num
+                        for i in range(len(matched_students))
+                        if matched_students[i] is not None}
+
         for s in student_tracker.get_all_students():
             if s.id_num not in detected_ids:
-                # update FACE_ABSENT
                 durations = s.temporal.update({"FACE_ABSENT"})
                 severity  = compute_severity({"FACE_ABSENT"}, durations)
                 s.update_behaviors({"FACE_ABSENT"}, durations, severity,
                                    0, 0, 0.30, False)
 
-        # ── STEP 5: Visual Render ──────────────────────────────────────
+        # ── STEP 5: Render ─────────────────────────────────────────────
         all_students = student_tracker.get_all_students()
         canvas = visual_render.render(frame, all_students, fps_counter.fps)
 
-        # ── STEP 6: Audio Alert ────────────────────────────────────────
+        # ── STEP 6: Audio ──────────────────────────────────────────────
         if not args.no_audio:
-            has_critical = any(s.severity == "CRITICAL" for s in all_students)
-            has_warning  = any(s.severity == "WARNING"  for s in all_students)
-
-            if has_critical:
+            has_crit = any(s.severity == "CRITICAL" for s in all_students)
+            has_warn = any(s.severity == "WARNING"  for s in all_students)
+            if has_crit:
                 audio_alert.alert_critical(cooldown=cfg.AUDIO_COOLDOWN_CRIT)
-            elif has_warning:
+            elif has_warn:
                 audio_alert.alert_warning(cooldown=cfg.AUDIO_COOLDOWN_WARN)
             elif prev_had_critical:
                 audio_alert.alert_clear()
+            prev_had_critical = has_crit
 
-            prev_had_critical = has_critical
-
-        # ── STEP 7: Display ────────────────────────────────────────────
+        # ── STEP 7: Tampilkan ──────────────────────────────────────────
         cv2.imshow("Classroom Monitor", canvas)
-
         key = cv2.waitKey(1) & 0xFF
+
         if key in (ord('q'), ord('Q'), 27):
             print("[System] Quit.")
             break
         elif key == ord('r'):
             student_tracker.reset()
-            _eye_trackers.clear()
-            print("[System] Session reset — all students cleared.")
+            eye_trackers.clear()
+            print("[System] Reset — semua student dihapus.")
         elif key == ord('s'):
-            fname = f"classroom_{time.strftime('%Y%m%d_%H%M%S')}.png"
-            cv2.imwrite(fname, canvas)
-            print(f"[System] Screenshot: {fname}")
+            fn = f"classroom_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            cv2.imwrite(fn, canvas)
+            print(f"[System] Screenshot: {fn}")
 
     # ── Cleanup ───────────────────────────────────────────────────────
     cap.release()
     face_detector.release()
     cv2.destroyAllWindows()
 
-    # ── Laporan akhir sesi ────────────────────────────────────────────
+    # ── Laporan akhir ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  FINAL SESSION REPORT")
     print("=" * 60)
     all_ever = student_tracker.get_all_ever()
     if all_ever:
-        print(f"  {'Student':<14} {'Score':>7}  {'Grade'}  "
-              f"{'Warn':>5}  {'Crit':>5}")
+        print(f"  {'Student':<14} {'Score':>7}  {'Grade'}  {'Warn':>5}  {'Crit':>5}")
         print("  " + "-" * 46)
         for s in all_ever:
-            print(f"  {s.label:<14} "
-                  f"{s.overall_score:>6.1f}   "
-                  f"  {s.grade}     "
-                  f"{s.session.warn_events:>4}   "
-                  f"{s.session.crit_events:>4}")
-    else:
-        print("  No students detected in this session.")
+            print(f"  {s.label:<14} {s.overall_score:>6.1f}     {s.grade}"
+                  f"     {s.session.warn_events:>4}   {s.session.crit_events:>4}")
     print("=" * 60)
 
 

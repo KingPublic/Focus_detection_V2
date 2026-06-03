@@ -1,25 +1,15 @@
 # =============================================================================
-# tracking/student_tracker.py
-# Persistent Student Tracker menggunakan IoU Matching
+# tracking/student_tracker.py  v3
 #
-# Algoritma:
-#   Setiap frame menghasilkan N bounding box wajah dari MediaPipe.
-#   Tracker mencocokkan setiap bbox baru dengan student yang sudah dikenali
-#   menggunakan IoU (Intersection over Union).
+# FIX KRITIS:
+#   update() sekarang mengembalikan List[StudentState] yang DIJAMIN sejajar
+#   dengan input bboxes — result[i] selalu sesuai dengan bboxes[i].
 #
-#   IoU = Area(A ∩ B) / Area(A ∪ B)
+#   Sebelumnya: tracker return list dengan urutan arbitrary → zip(faces,students)
+#   salah pasang → behavior student A ke-assign ke student B.
 #
-#   Jika IoU >= threshold → bbox baru = update student lama (ID tetap)
-#   Jika IoU <  threshold → tidak ada match → student baru → ID baru
-#
-#   Prinsip Hungarian Assignment:
-#     Gunakan greedy matching (cukup untuk kelas dengan wajah tidak saling
-#     tumpang tindih). Untuk akurasi lebih tinggi bisa upgrade ke
-#     scipy.optimize.linear_sum_assignment (Hungarian algorithm).
-#
-# Referensi:
-#   Bewley et al., "Simple Online and Realtime Tracking (SORT)," ICIP, 2016.
-#   (Versi ini disederhanakan: tanpa Kalman filter, hanya IoU matching)
+#   Sekarang: update() return Dict[int, StudentState] dimapping ke bbox index,
+#   sehingga main.py bisa akses student yang tepat untuk tiap face_data.
 # =============================================================================
 
 import numpy as np
@@ -30,154 +20,140 @@ import config.settings as cfg
 from tracking.student_state import StudentState
 
 
-def _bbox_to_xyxy(bbox: Tuple[int,int,int,int]) -> Tuple[int,int,int,int]:
-    """Konversi (x, y, w, h) → (x1, y1, x2, y2)."""
-    x, y, w, h = bbox
-    return x, y, x + w, y + h
-
-
 def compute_iou(bbox_a: Tuple, bbox_b: Tuple) -> float:
-    """
-    Hitung IoU antara dua bounding box format (x,y,w,h).
-
-    IoU = Intersection Area / Union Area
-
-    Returns:
-        float dalam [0.0, 1.0]
-    """
-    ax1, ay1, ax2, ay2 = _bbox_to_xyxy(bbox_a)
-    bx1, by1, bx2, by2 = _bbox_to_xyxy(bbox_b)
-
-    # Intersection
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    inter_w = max(0, ix2 - ix1)
-    inter_h = max(0, iy2 - iy1)
-    inter   = inter_w * inter_h
-
+    ax, ay, aw, ah = bbox_a
+    bx, by, bw, bh = bbox_b
+    ix1 = max(ax, bx);       iy1 = max(ay, by)
+    ix2 = min(ax+aw, bx+bw); iy2 = min(ay+ah, by+bh)
+    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
     if inter == 0:
         return 0.0
-
-    area_a = (ax2 - ax1) * (ay2 - ay1)
-    area_b = (bx2 - bx1) * (by2 - by1)
-    union  = area_a + area_b - inter
-
+    union = aw*ah + bw*bh - inter
     return inter / union if union > 0 else 0.0
 
 
 class StudentTracker:
     """
-    Mengelola identitas semua mahasiswa yang terdeteksi dalam satu sesi.
+    Persistent student tracker dengan IoU matching.
 
-    Fungsi utama:
-        update(bboxes) → List[StudentState]
-            Menerima list bounding box frame ini, mencocokkan dengan
-            student yang dikenal, membuat student baru jika perlu,
-            dan mengembalikan list StudentState aktif.
+    update() mengembalikan list StudentState yang SEJAJAR dengan input bboxes:
+        result[i] = StudentState untuk bboxes[i]
 
-    ID Assignment:
-        - ID diberikan secara berurutan (1, 2, 3, ...)
-        - ID tidak pernah di-recycle dalam satu sesi
-        - Student yang timeout dipertahankan di _history untuk laporan akhir
+    Ini menjamin zip(faces, matched_students) selalu benar.
     """
 
     def __init__(self):
-        self._active:  Dict[int, StudentState] = {}  # id → StudentState (di frame)
-        self._history: Dict[int, StudentState] = {}  # id → StudentState (sudah absent)
-        self._next_id: int = 1
-        print("[StudentTracker] Initialized.")
+        self._students: Dict[int, StudentState] = {}  # id → state
+        self._history:  Dict[int, StudentState] = {}
+        self._next_id:  int = 1
+        print("[StudentTracker] v3 initialized — aligned output guaranteed.")
 
-    # ------------------------------------------------------------------ #
-
-    def update(self, bboxes: List[Tuple[int,int,int,int]]) -> List[StudentState]:
+    def update(self,
+               bboxes: List[Tuple[int,int,int,int]]
+               ) -> List[Optional[StudentState]]:
         """
-        Update tracker dengan bbox-bbox baru dari frame ini.
-
-        Langkah:
-            1. Hitung IoU matrix: active_students × new_bboxes
-            2. Greedy match: tiap bbox baru → student dengan IoU tertinggi
-            3. Unmatched bbox → student baru
-            4. Unmatched student → timeout check → mark absent
-
-        Args:
-            bboxes: List (x, y, w, h) dari MediaPipe frame ini
+        Cocokkan bbox baru dengan student yang dikenal.
 
         Returns:
-            List StudentState yang aktif saat ini (termasuk yang baru)
+            List[StudentState] dengan panjang = len(bboxes).
+            result[i] adalah StudentState untuk bboxes[i].
+            Tidak ada None — setiap bbox pasti dapat StudentState
+            (lama atau baru).
         """
-        # ── Cek timeout student yang tidak terlihat ────────────────────
-        for sid, student in list(self._active.items()):
-            if student.check_timeout():
-                student.mark_absent()
-                self._history[sid] = student
-                del self._active[sid]
+        # ── Timeout check ──────────────────────────────────────────────
+        for sid in list(self._students.keys()):
+            s = self._students[sid]
+            if s.check_timeout():
+                s.mark_absent()
+                self._history[sid] = s
+                del self._students[sid]
+
+        # ── Hasil: satu StudentState per bbox input ─────────────────────
+        result: List[Optional[StudentState]] = [None] * len(bboxes)
 
         if not bboxes:
-            return list(self._active.values())
+            return result
 
-        # ── Bangun IoU matrix ──────────────────────────────────────────
-        active_ids    = list(self._active.keys())
-        n_active      = len(active_ids)
-        n_new         = len(bboxes)
+        active_ids = list(self._students.keys())
+        n_active   = len(active_ids)
+        n_new      = len(bboxes)
 
-        matched_students: set = set()   # id student yang sudah dicocokkan
-        matched_bboxes:   set = set()   # indeks bbox yang sudah dicocokkan
+        matched_student_ids: set = set()   # student id yang sudah di-match
+        matched_bbox_idx:    set = set()   # indeks bbox yang sudah di-match
 
         if n_active > 0:
-            # iou_matrix[i][j] = IoU antara student i dan bbox baru j
-            iou_matrix = np.zeros((n_active, n_new), dtype=np.float32)
+            # Bangun IoU matrix [n_active × n_new]
+            iou_mat = np.zeros((n_active, n_new), dtype=np.float32)
             for i, sid in enumerate(active_ids):
                 for j, bbox in enumerate(bboxes):
-                    iou_matrix[i][j] = compute_iou(
-                        self._active[sid].bbox, bbox
-                    )
+                    iou_mat[i, j] = compute_iou(self._students[sid].bbox, bbox)
 
-            # Greedy matching: ambil pasangan IoU tertinggi berulang
+            # Greedy matching dengan tie-break jarak center
             while True:
-                if iou_matrix.max() < cfg.IOU_MATCH_THRESHOLD:
+                if iou_mat.max() < cfg.IOU_MATCH_THRESHOLD:
                     break
-                i, j = np.unravel_index(iou_matrix.argmax(), iou_matrix.shape)
-                sid   = active_ids[i]
 
-                # Match: update student lama dengan bbox baru
-                self._active[sid].mark_seen(bboxes[j])
-                matched_students.add(sid)
-                matched_bboxes.add(j)
+                max_val    = iou_mat.max()
+                candidates = np.argwhere(iou_mat >= max_val - 0.01)
 
-                # Hapus dari matrix agar tidak dicocokkan lagi
-                iou_matrix[i, :] = 0
-                iou_matrix[:, j] = 0
+                # Tie-break: pilih pasangan dengan jarak center terpendek
+                best_i, best_j = candidates[0]
+                best_dist = float('inf')
+                for ci, cj in candidates:
+                    sid_c = active_ids[ci]
+                    cx_s, cy_s = self._students[sid_c].bbox_center
+                    bx, by, bw, bh = bboxes[cj]
+                    dist = (cx_s - (bx + bw//2))**2 + (cy_s - (by + bh//2))**2
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_i, best_j = ci, cj
 
-        # ── Bbox baru yang tidak cocok → student baru ─────────────────
-        for j, bbox in enumerate(bboxes):
-            if j not in matched_bboxes:
+                sid = active_ids[best_i]
+                self._students[sid].mark_seen(bboxes[best_j])
+                matched_student_ids.add(sid)
+                matched_bbox_idx.add(best_j)
+
+                # ── KUNCI FIX: catat student di posisi bbox yang tepat ──
+                result[best_j] = self._students[sid]
+
+                iou_mat[best_i, :] = 0
+                iou_mat[:, best_j] = 0
+
+        # ── Bbox yang tidak match → student baru ───────────────────────
+        for j in range(n_new):
+            if j not in matched_bbox_idx:
                 if self._next_id <= cfg.MAX_STUDENTS:
-                    new_student = StudentState(self._next_id)
-                    new_student.mark_seen(bbox)
-                    self._active[self._next_id] = new_student
-                    print(f"[Tracker] New student: {new_student.label}")
+                    ns = StudentState(self._next_id)
+                    ns.mark_seen(bboxes[j])
+                    self._students[self._next_id] = ns
+                    result[j] = ns
+                    print(f"[Tracker] New: {ns.label}")
                     self._next_id += 1
 
-        return list(self._active.values())
+        # ── Safety: pastikan tidak ada None di result ───────────────────
+        for j in range(n_new):
+            if result[j] is None:
+                # Fallback: assign student baru
+                ns = StudentState(self._next_id)
+                ns.mark_seen(bboxes[j])
+                self._students[self._next_id] = ns
+                result[j] = ns
+                self._next_id += 1
+
+        return result
 
     def get_all_students(self) -> List[StudentState]:
-        """Kembalikan semua student aktif saat ini."""
-        return list(self._active.values())
+        return list(self._students.values())
 
     def get_history(self) -> List[StudentState]:
-        """Kembalikan student yang sudah tidak aktif (untuk laporan)."""
         return list(self._history.values())
 
     def get_all_ever(self) -> List[StudentState]:
-        """Semua student yang pernah terdeteksi (aktif + history)."""
-        combined = {**self._history, **self._active}
+        combined = {**self._history, **self._students}
         return sorted(combined.values(), key=lambda s: s.id_num)
 
     def reset(self):
-        self._active.clear()
+        self._students.clear()
         self._history.clear()
         self._next_id = 1
         print("[StudentTracker] Reset.")

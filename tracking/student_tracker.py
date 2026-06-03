@@ -1,159 +1,141 @@
 # =============================================================================
-# tracking/student_tracker.py  v3
+# tracking/student_tracker.py — Zone-Based 2-Student Tracker
 #
-# FIX KRITIS:
-#   update() sekarang mengembalikan List[StudentState] yang DIJAMIN sejajar
-#   dengan input bboxes — result[i] selalu sesuai dengan bboxes[i].
+# Pendekatan: ZONE-BASED (bukan IoU re-identification)
 #
-#   Sebelumnya: tracker return list dengan urutan arbitrary → zip(faces,students)
-#   salah pasang → behavior student A ke-assign ke student B.
+# Frame dibagi dua zona vertikal:
+#   ┌─────────┬─────────┐
+#   │  ZONE 1 │  ZONE 2 │
+#   │  S01    │  S02    │
+#   │  (kiri) │(kanan)  │
+#   └─────────┴─────────┘
 #
-#   Sekarang: update() return Dict[int, StudentState] dimapping ke bbox index,
-#   sehingga main.py bisa akses student yang tepat untuk tiap face_data.
+# Rules:
+#   - Wajah dengan bbox center x < split_x  → selalu S01
+#   - Wajah dengan bbox center x >= split_x → selalu S02
+#   - Jika tidak ada wajah di zona → student ABSENT
+#   - Jika kembali ke zona → student yang SAMA (persistent by design)
+#   - Tidak perlu re-identification — zona = identitas
+#
+# Keunggulan vs IoU tracking:
+#   - Tidak crash saat student pergi/kembali
+#   - ID 100% persistent selama tidak pindah zona
+#   - Sangat stabil dan mudah dijelaskan di paper
+#   - Tidak terpengaruh pergerakan kepala
 # =============================================================================
 
-import numpy as np
 import time
-from typing import Dict, List, Tuple, Optional
-
+from typing import List, Tuple, Optional
 import config.settings as cfg
 from tracking.student_state import StudentState
 
 
-def compute_iou(bbox_a: Tuple, bbox_b: Tuple) -> float:
-    ax, ay, aw, ah = bbox_a
-    bx, by, bw, bh = bbox_b
-    ix1 = max(ax, bx);       iy1 = max(ay, by)
-    ix2 = min(ax+aw, bx+bw); iy2 = min(ay+ah, by+bh)
-    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-    if inter == 0:
-        return 0.0
-    union = aw*ah + bw*bh - inter
-    return inter / union if union > 0 else 0.0
-
-
 class StudentTracker:
     """
-    Persistent student tracker dengan IoU matching.
+    Zone-Based 2-Student Tracker.
 
-    update() mengembalikan list StudentState yang SEJAJAR dengan input bboxes:
-        result[i] = StudentState untuk bboxes[i]
-
-    Ini menjamin zip(faces, matched_students) selalu benar.
+    Hanya dua slot: S01 (kiri) dan S02 (kanan).
+    Slot ditentukan oleh posisi horizontal bbox center, bukan IoU matching.
     """
 
-    def __init__(self):
-        self._students: Dict[int, StudentState] = {}  # id → state
-        self._history:  Dict[int, StudentState] = {}
-        self._next_id:  int = 1
-        print("[StudentTracker] v3 initialized — aligned output guaranteed.")
+    def __init__(self, frame_width: int = 1280):
+        self._fw       = frame_width
+        self._split_x  = int(frame_width * cfg.SPLIT_RATIO)
+
+        # Dua slot tetap — tidak pernah dihapus
+        self._s01 = StudentState(1)   # Zona kiri
+        self._s02 = StudentState(2)   # Zona kanan
+
+        self._s01.is_active = False
+        self._s02.is_active = False
+
+        print(f"[ZoneTracker] split_x={self._split_x}px  "
+              f"(S01: 0-{self._split_x}  |  S02: {self._split_x}-{frame_width})")
+
+    # ------------------------------------------------------------------ #
 
     def update(self,
                bboxes: List[Tuple[int,int,int,int]]
                ) -> List[Optional[StudentState]]:
         """
-        Cocokkan bbox baru dengan student yang dikenal.
+        Cocokkan setiap bbox ke zona (kiri/kanan).
 
         Returns:
-            List[StudentState] dengan panjang = len(bboxes).
-            result[i] adalah StudentState untuk bboxes[i].
-            Tidak ada None — setiap bbox pasti dapat StudentState
-            (lama atau baru).
-        """
-        # ── Timeout check ──────────────────────────────────────────────
-        for sid in list(self._students.keys()):
-            s = self._students[sid]
-            if s.check_timeout():
-                s.mark_absent()
-                self._history[sid] = s
-                del self._students[sid]
+            List[StudentState] sejajar dengan input bboxes.
+            result[i] = StudentState (S01 atau S02) untuk bboxes[i].
 
-        # ── Hasil: satu StudentState per bbox input ─────────────────────
+        Logika assignment:
+            1. Hitung bbox center x untuk setiap wajah
+            2. center_x < split_x  → S01
+            3. center_x >= split_x → S02
+            4. Jika dua wajah masuk zona yang sama → ambil yang lebih besar
+               (heuristik: wajah lebih besar = lebih dekat ke kamera = lebih valid)
+        """
+        now = time.monotonic()
+
+        # Reset kehadiran frame ini
+        s01_candidate: Optional[Tuple[int, Tuple]] = None  # (area, bbox)
+        s02_candidate: Optional[Tuple[int, Tuple]] = None
+
         result: List[Optional[StudentState]] = [None] * len(bboxes)
 
-        if not bboxes:
-            return result
+        # ── Tentukan zona tiap bbox ─────────────────────────────────────
+        for i, bbox in enumerate(bboxes):
+            x, y, w, h = bbox
+            center_x   = x + w // 2
+            area       = w * h
 
-        active_ids = list(self._students.keys())
-        n_active   = len(active_ids)
-        n_new      = len(bboxes)
+            if center_x < self._split_x:
+                # Zona kiri → kandidat S01
+                if s01_candidate is None or area > s01_candidate[0]:
+                    s01_candidate = (area, bbox, i)
+            else:
+                # Zona kanan → kandidat S02
+                if s02_candidate is None or area > s02_candidate[0]:
+                    s02_candidate = (area, bbox, i)
 
-        matched_student_ids: set = set()   # student id yang sudah di-match
-        matched_bbox_idx:    set = set()   # indeks bbox yang sudah di-match
+        # ── Update S01 ─────────────────────────────────────────────────
+        if s01_candidate is not None:
+            _, bbox, idx  = s01_candidate
+            self._s01.mark_seen(bbox)
+            result[idx]   = self._s01
+        else:
+            # Tidak ada wajah di zona kiri
+            if (now - self._s01.last_seen) > cfg.ABSENT_TIMEOUT_SEC:
+                self._s01.is_active = False
 
-        if n_active > 0:
-            # Bangun IoU matrix [n_active × n_new]
-            iou_mat = np.zeros((n_active, n_new), dtype=np.float32)
-            for i, sid in enumerate(active_ids):
-                for j, bbox in enumerate(bboxes):
-                    iou_mat[i, j] = compute_iou(self._students[sid].bbox, bbox)
-
-            # Greedy matching dengan tie-break jarak center
-            while True:
-                if iou_mat.max() < cfg.IOU_MATCH_THRESHOLD:
-                    break
-
-                max_val    = iou_mat.max()
-                candidates = np.argwhere(iou_mat >= max_val - 0.01)
-
-                # Tie-break: pilih pasangan dengan jarak center terpendek
-                best_i, best_j = candidates[0]
-                best_dist = float('inf')
-                for ci, cj in candidates:
-                    sid_c = active_ids[ci]
-                    cx_s, cy_s = self._students[sid_c].bbox_center
-                    bx, by, bw, bh = bboxes[cj]
-                    dist = (cx_s - (bx + bw//2))**2 + (cy_s - (by + bh//2))**2
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_i, best_j = ci, cj
-
-                sid = active_ids[best_i]
-                self._students[sid].mark_seen(bboxes[best_j])
-                matched_student_ids.add(sid)
-                matched_bbox_idx.add(best_j)
-
-                # ── KUNCI FIX: catat student di posisi bbox yang tepat ──
-                result[best_j] = self._students[sid]
-
-                iou_mat[best_i, :] = 0
-                iou_mat[:, best_j] = 0
-
-        # ── Bbox yang tidak match → student baru ───────────────────────
-        for j in range(n_new):
-            if j not in matched_bbox_idx:
-                if self._next_id <= cfg.MAX_STUDENTS:
-                    ns = StudentState(self._next_id)
-                    ns.mark_seen(bboxes[j])
-                    self._students[self._next_id] = ns
-                    result[j] = ns
-                    print(f"[Tracker] New: {ns.label}")
-                    self._next_id += 1
-
-        # ── Safety: pastikan tidak ada None di result ───────────────────
-        for j in range(n_new):
-            if result[j] is None:
-                # Fallback: assign student baru
-                ns = StudentState(self._next_id)
-                ns.mark_seen(bboxes[j])
-                self._students[self._next_id] = ns
-                result[j] = ns
-                self._next_id += 1
+        # ── Update S02 ─────────────────────────────────────────────────
+        if s02_candidate is not None:
+            _, bbox, idx  = s02_candidate
+            self._s02.mark_seen(bbox)
+            result[idx]   = self._s02
+        else:
+            if (now - self._s02.last_seen) > cfg.ABSENT_TIMEOUT_SEC:
+                self._s02.is_active = False
 
         return result
 
-    def get_all_students(self) -> List[StudentState]:
-        return list(self._students.values())
+    # ------------------------------------------------------------------ #
 
-    def get_history(self) -> List[StudentState]:
-        return list(self._history.values())
+    def get_all_students(self) -> List[StudentState]:
+        """Kembalikan kedua student (aktif maupun absent)."""
+        return [self._s01, self._s02]
+
+    def get_split_x(self) -> int:
+        return self._split_x
 
     def get_all_ever(self) -> List[StudentState]:
-        combined = {**self._history, **self._students}
-        return sorted(combined.values(), key=lambda s: s.id_num)
+        return [self._s01, self._s02]
 
     def reset(self):
-        self._students.clear()
-        self._history.clear()
-        self._next_id = 1
-        print("[StudentTracker] Reset.")
+        """Reset skor dan timer kedua student, ID tetap."""
+        from tracking.student_state import _TemporalTracker, _ScoreCalc, _SessionLog
+        for s in [self._s01, self._s02]:
+            s.temporal   = _TemporalTracker()
+            s.score_calc = _ScoreCalc()
+            s.session    = _SessionLog()
+            s.active_behaviors = set()
+            s.durations        = {}
+            s.severity         = "OK"
+            s.is_active        = False
+        print("[ZoneTracker] Reset — scores cleared, IDs preserved.")

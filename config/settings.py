@@ -12,14 +12,20 @@ TARGET_FPS      = 30
 # Untuk kelas, set tinggi. FPS akan turun jika terlalu banyak wajah.
 # Rekomendasi: 10 untuk kelas kecil, 15 untuk kelas besar.
 MAX_NUM_FACES               = 15
-MIN_DETECTION_CONFIDENCE    = 0.5
-MIN_TRACKING_CONFIDENCE     = 0.5
+MIN_DETECTION_CONFIDENCE    = 0.72  # Dinaikkan: filter objek bukan wajah
+MIN_TRACKING_CONFIDENCE     = 0.65  # Dinaikkan: tracking lebih stabil
 REFINE_LANDMARKS            = True
 
-# --- STUDENT TRACKER ---
-IOU_MATCH_THRESHOLD   = 0.25   # IoU minimum untuk dianggap orang yang sama
-ABSENT_TIMEOUT_SEC    = 4.0    # Detik sebelum student dianggap keluar frame
-MAX_STUDENTS          = 30     # Batas ID student yang diingat dalam sesi
+# --- ZONE-BASED TRACKING (2 Students) ---
+# Frame dibagi dua secara vertikal:
+#   Zona KIRI  (x < SPLIT_RATIO * frame_width) = Student_01
+#   Zona KANAN (x >= SPLIT_RATIO * frame_width) = Student_02
+SPLIT_RATIO           = 0.50   # 0.50 = tepat tengah, geser jika perlu
+SHOW_SPLIT_LINE       = True   # Tampilkan garis pemisah zona di frame
+NMS_OVERLAP_THRESHOLD = 0.40   # NMS: hapus bbox overlap berlebihan
+MIN_FACE_SIZE_PX      = 55     # Minimal ukuran wajah (px)
+ABSENT_TIMEOUT_SEC    = 3.0    # Detik sampai student dianggap absent
+MAX_STUDENTS          = 2      # Maksimal 2 student (kiri + kanan)
 
 # --- HEAD POSE THRESHOLDS (derajat) ---
 YAW_THRESHOLD_LEFT    = -20.0
